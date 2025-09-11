@@ -7,10 +7,15 @@ os.environ["VLLM_SKIP_WARMUP"] = "true"
 os.environ["PT_HPU_LAZY_MODE"] = "1"
 
 import vllm
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.entrypoints.openai.api_server import build_async_engine_client_from_engine_args
+from vllm.utils import merge_async_iterators
+from tqdm import tqdm
 import torch
 import pandas as pd
 import time
 import argparse
+import asyncio
 
 def get_ds(args):
     print(f"Loading dataset: {args.dataset}")
@@ -119,6 +124,28 @@ def generate_responses(llm, input_batch, args, sampling_params=None, prompt_toke
         total_input_tokens += len(response.prompt_token_ids)
         total_generated_tokens += len(response.outputs[0].token_ids)
 
+async def generate_responses_async(llm, input_batch, args, sampling_params):
+    if not input_batch:
+        return
+    # Create one generator per prompt (like benchmark_throughput.py)
+    generators = []
+    for i, prompt in enumerate(input_batch):
+        gen = llm.generate(prompt, sampling_params, request_id=f"cal-{i}")
+        generators.append(gen)
+
+    pbar = tqdm(total=len(generators), disable=not args.verbose and False)
+    finished = set()
+    async for idx, res in merge_async_iterators(*generators):
+        if res is None:
+            continue
+        # res.finished exists; if not, fallback to last chunk heuristic (outputs len >0 and no next tokens)
+        done = getattr(res, "finished", False)
+        if done and idx not in finished:
+            finished.add(idx)
+            if args.verbose and res.outputs:
+                print(f"Prompt[{idx}] done. Generated tokens={len(res.outputs[0].token_ids)}")
+            pbar.update(1)
+    pbar.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -147,53 +174,121 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if not args.auto_process_dataset:
         calibration_ds = get_ds(args)
-    llm = vllm.LLM(
-        model=args.model,
-        dtype=torch.bfloat16,
-        enforce_eager=args.enforce_eager,
-        max_num_seqs=args.batch_size,
-        tensor_parallel_size=args.tensor_parallel_size,
-        pipeline_parallel_size=args.pipeline_parallel_size,
-        max_model_len=args.max_model_len,
-        max_num_prefill_seqs=args.max_num_prefill_seqs,
-        trust_remote_code=True,
-        distributed_executor_backend=args.distributed_executor_backend,
-        enable_expert_parallel=args.expert_parallel,
-    )
 
-    sampling_params = vllm.SamplingParams(
-        temperature=0.0, top_p=1, max_tokens=args.max_tokens
-    )
-    
-    if not args.auto_process_dataset:
-        input_batch = []
-        dataset_len = len(calibration_ds)
-        batch_num = dataset_len // args.batch_size if dataset_len % args.batch_size == 0 else (
-            dataset_len // args.batch_size) + 1
-        batch_done = 0
-        for i, (_, row) in enumerate(calibration_ds.iterrows()):
-            input_batch.append(row["input"])
-            if i and i % args.batch_size == 0:
-                t_start = time.perf_counter()
-                generate_responses(llm, input_batch, args)
-                t_end = time.perf_counter()
-                batch_done += 1
-                print(
-                    f"Batch finished: {i}/{calibration_ds.shape[0]} samples done; ETA: {int((t_end - t_start) * (batch_num - batch_done) // 60)} min")
-                input_batch = []
-        generate_responses(llm, input_batch, args)
-        print(
-            f"Last batch finished: {i + 1}/{calibration_ds.shape[0]} samples done")
+    sampling_params = vllm.SamplingParams(temperature=0.0, top_p=1, max_tokens=args.max_tokens)
+
+    use_async = args.pipeline_parallel_size > 1
+    if not use_async:
+        # Synchronous (PP=1)
+        llm = vllm.LLM(
+            model=args.model,
+            dtype=torch.bfloat16,
+            enforce_eager=args.enforce_eager,
+            max_num_seqs=args.batch_size,
+            tensor_parallel_size=args.tensor_parallel_size,
+            pipeline_parallel_size=args.pipeline_parallel_size,
+            max_model_len=args.max_model_len,
+            max_num_prefill_seqs=args.max_num_prefill_seqs,
+            trust_remote_code=True,
+            distributed_executor_backend=args.distributed_executor_backend,
+            enable_expert_parallel=args.expert_parallel,
+        )
     else:
-        prompts, prompt_token_ids, gt = get_dataset(args)
-        generate_responses(
-            llm=llm,
-            input_batch=None,
-            args=args,
-            sampling_params=sampling_params,
-            prompt_token_ids=prompt_token_ids,
+        # Async engine required for PP>1
+        async_engine_args = AsyncEngineArgs(
+            model=args.model,
+            tensor_parallel_size=args.tensor_parallel_size,
+            pipeline_parallel_size=args.pipeline_parallel_size,
+            dtype="bfloat16",
+            enforce_eager=args.enforce_eager,
+            max_model_len=args.max_model_len,
+            max_num_seqs=args.batch_size,
+            max_num_prefill_seqs=args.max_num_prefill_seqs,
+            trust_remote_code=True,
+            distributed_executor_backend=args.distributed_executor_backend,
+            enable_expert_parallel=args.expert_parallel,
         )
     
-    # Skip shutdown when VLLM_USE_V1 is set to "1"
-    if not os.environ.get("VLLM_USE_V1") or os.environ.get("VLLM_USE_V1") != "1":
-        llm.llm_engine.model_executor.shutdown()
+    def _run_sync():
+        if not args.auto_process_dataset:
+            input_batch = []
+            dataset_len = len(calibration_ds)
+            batch_num = (dataset_len + args.batch_size - 1) // args.batch_size
+            batch_done = 0
+            for i, (_, row) in enumerate(calibration_ds.iterrows()):
+                input_batch.append(row["input"])
+                if len(input_batch) == args.batch_size:
+                    t_start = time.perf_counter()
+                    generate_responses(llm, input_batch, args)
+                    t_end = time.perf_counter()
+                    batch_done += 1
+                    print(f"Batch finished: {(batch_done*args.batch_size)}/{calibration_ds.shape[0]} samples done; "
+                          f"ETA: {int((t_end - t_start) * (batch_num - batch_done) // 60)} min")
+                    input_batch = []
+            if input_batch:
+                generate_responses(llm, input_batch, args)
+                print(f"Last batch finished: {dataset_len}/{calibration_ds.shape[0]} samples done")
+        else:
+            prompts, prompt_token_ids, gt = get_dataset(args)
+            generate_responses(
+                llm=llm,
+                input_batch=None,
+                args=args,
+                sampling_params=sampling_params,
+                prompt_token_ids=prompt_token_ids,
+            )
+
+    async def _run_async():
+        async with build_async_engine_client_from_engine_args(
+            async_engine_args,
+            disable_frontend_multiprocessing=False,
+        ) as async_llm:
+            try:
+                if not args.auto_process_dataset:
+                    # Stream batches exactly like sync path: slice dataset into batches
+                    dataset_len = len(calibration_ds)
+                    for start in range(0, dataset_len, args.batch_size):
+                        batch_prompts = calibration_ds.iloc[start:start + args.batch_size]["input"].tolist()
+                        t_start = time.perf_counter()
+                        await generate_responses_async(async_llm, batch_prompts, args, sampling_params)
+                        t_end = time.perf_counter()
+                        done = min(start + args.batch_size, dataset_len)
+                        remaining_batches = max((dataset_len - done + args.batch_size - 1) // args.batch_size, 0)
+                        eta_min = int((t_end - t_start) * remaining_batches // 60)
+                        print(f"Batch finished: {done}/{dataset_len} samples done; ETA: {eta_min} min")
+                else:
+                    # ORIGINAL SYNC MODE: input_batch=None + prompt_token_ids (truncated)
+                    # ASYNC MODE: must supply strings; recreate truncated prompts from token ids.
+                    prompts, prompt_token_ids, _ = get_dataset(args)
+                    from transformers import AutoTokenizer
+                    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+                    # prompt_token_ids already truncated to sample_len; decode them to safe prompts.
+                    truncated_prompts = [tokenizer.decode(tids, skip_special_tokens=False)
+                                         for tids in prompt_token_ids]
+                    # Use truncated prompts (NOT the raw 'prompts' list) to avoid exceeding max_model_len.
+                    await generate_responses_async(async_llm, truncated_prompts, args, sampling_params)
+                await asyncio.sleep(0.05)
+            finally:
+                pass
+
+    if use_async:
+        # Manual loop for cleaner shutdown
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(_run_async())
+            # Cancel any leftover tasks to avoid late callbacks
+            pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+            for t in pending:
+                t.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        finally:
+            loop.close()
+    else:
+        _run_sync()
+    
+    if not use_async:
+        # Skip shutdown when VLLM_USE_V1 is set to "1"
+        if not os.environ.get("VLLM_USE_V1") or os.environ.get("VLLM_USE_V1") != "1":
+            llm.llm_engine.model_executor.shutdown()
