@@ -18,13 +18,14 @@ usage() {
     echo "  -b    - batch size to run the measurements at (default: 32)"
     echo "  -l    - limit number of samples in calibration dataset"
     echo "  -t    - tensor parallel size to run at (default: 1); NOTE: if t > 8 then we need a multi-node setup"
+    echo "  -p    - pipeline parallel size to run at (default: 1); multi-node if t*p > 8"
     echo "  -r    - rank of unified measurements, it should be smaller than original rank number and should be a factor of the original rank number"
     echo "  -u    - use expert parallelism (default: False), expert parallelism unification rule is unique, card 1 expert measurement will be extended to card 0 if unified to x from 2x cards number"
     echo "  -e    - set this flag to enable enforce_eager execution"
     echo
 }
 
-while getopts "m:d:o:b:l:t:r:ueh" OPT; do
+while getopts "m:d:o:b:l:t:p:r:ueh" OPT; do
     case ${OPT} in
         m )
             MODEL_PATH="$OPTARG"
@@ -43,6 +44,9 @@ while getopts "m:d:o:b:l:t:r:ueh" OPT; do
             ;;
         t )
             TP_SIZE="$OPTARG"
+            ;;
+        p )
+            PP_SIZE="$OPTARG"
             ;;
         r )
             RANK="$OPTARG"
@@ -73,6 +77,7 @@ fi
 BATCH_SIZE=${BATCH_SIZE:-"32"}
 LIMIT=${LIMIT:-""}
 TP_SIZE=${TP_SIZE:-"1"}
+PP_SIZE=${PP_SIZE:-"1"}
 RANK=${RANK:-""}
 USE_EP=${USE_EP:-""}
 ENFORCE_EAGER=${ENFORCE_EAGER:-"false"}
@@ -220,17 +225,16 @@ if [[ ! " ${ALLOWED_DEVICES[*]} " =~ " $DEVICE_TYPE " ]]; then
     exit 1
 fi
 
-if [[ $TP_SIZE -gt 8 ]]; then
+if [[ $((TP_SIZE * PP_SIZE)) -gt 8 ]]; then
     MULTI_NODE_SETUP=true
 fi
 
 if $MULTI_NODE_SETUP; then
     RAY_AVAILABLE_RESOURCES=$(python3 -c 'import ray; ray.init(); print(int(ray.available_resources()["HPU"]))')
-    if [[ $RAY_AVAILABLE_RESOURCES -lt $TP_SIZE ]]; then
-        echo "Required TP size : $TP_SIZE" 
-        echo "Available HPU's : $RAY_AVAILABLE_RESOURCES "
+    if [[ $RAY_AVAILABLE_RESOURCES -lt $((TP_SIZE * PP_SIZE)) ]]; then
+        echo "Required total (TP * PP) size : $((TP_SIZE * PP_SIZE))"
+        echo "Available HPU's : $RAY_AVAILABLE_RESOURCES"
         echo "!! Exiting since not enough HPU resources available. You can run 'ray status' to see available resources"
-        echo "Refer https://github.com/HabanaAI/vllm-hpu-extension/tree/main/calibration#experimental-multi-node-fp8-calibration for multi-node runs"
         exit 1
     fi
 
@@ -312,9 +316,9 @@ fi
 echo ""
 echo "2/4 Measuring scales"
 if $MULTI_NODE_SETUP; then
-    env $EXTRA_ENVS_STEP_2 python3 step-2-measure-scales.py -m $MODEL_PATH --tensor-parallel-size $TP_SIZE -d $MODEL_NAME-calibration-dataset.pkl --batch-size $BATCH_SIZE --distributed-executor-backend ray  $EXTRA_FLAGS_STEP_2 || (echo "Error in step 2" && exit 1)
+    env $EXTRA_ENVS_STEP_2 python3 step-2-measure-scales.py -m $MODEL_PATH --tensor-parallel-size $TP_SIZE --pipeline-parallel-size $PP_SIZE -d $MODEL_NAME-calibration-dataset.pkl --batch-size $BATCH_SIZE --distributed-executor-backend ray  $EXTRA_FLAGS_STEP_2 || (echo "Error in step 2" && exit 1)
 else
-    env $EXTRA_ENVS_STEP_2 python3 step-2-measure-scales.py -m $MODEL_PATH --tensor-parallel-size $TP_SIZE -d $MODEL_NAME-calibration-dataset.pkl --batch-size $BATCH_SIZE $EXTRA_FLAGS_STEP_2 || (echo "Error in step 2" && exit 1)
+    env $EXTRA_ENVS_STEP_2 python3 step-2-measure-scales.py -m $MODEL_PATH --tensor-parallel-size $TP_SIZE --pipeline-parallel-size $PP_SIZE -d $MODEL_NAME-calibration-dataset.pkl --batch-size $BATCH_SIZE $EXTRA_FLAGS_STEP_2 || (echo "Error in step 2" && exit 1)
 fi
 echo "Step 2/4 done"
 
@@ -335,9 +339,9 @@ fi
 echo ""
 echo "4/4 Quantize scales"
 if $MULTI_NODE_SETUP; then
-    env $EXTRA_ENVS_STEP_4 python3 step-4-quantize-scales.py --model $MODEL_PATH --tensor-parallel-size $TP_SIZE --distributed-executor-backend ray $EXTRA_FLAGS_STEP_4 || (echo "Error in step 4" && exit 1)
+    env $EXTRA_ENVS_STEP_4 python3 step-4-quantize-scales.py --model $MODEL_PATH --tensor-parallel-size $TP_SIZE --pipeline-parallel-size $PP_SIZE --distributed-executor-backend ray $EXTRA_FLAGS_STEP_4 || (echo "Error in step 4" && exit 1)
 else
-    env $EXTRA_ENVS_STEP_4 python3 step-4-quantize-scales.py --model $MODEL_PATH --tensor-parallel-size $TP_SIZE $EXTRA_FLAGS_STEP_4 || (echo "Error in step 4" && exit 1)
+    env $EXTRA_ENVS_STEP_4 python3 step-4-quantize-scales.py --model $MODEL_PATH --tensor-parallel-size $TP_SIZE --pipeline-parallel-size $PP_SIZE $EXTRA_FLAGS_STEP_4 || (echo "Error in step 4" && exit 1)
 fi
 
 if [[ -n $RANK ]]; then

@@ -126,6 +126,7 @@ if __name__ == "__main__":
     parser.add_argument("-m", "--model", type=str, required=True)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--pipeline-parallel-size", type=int, default=1)
     parser.add_argument("--max-dataset-samples", type=int, default=0)
     parser.add_argument("--max-num-prefill-seqs", type=int, default=None)
     parser.add_argument("--expert-parallel", action="store_true", default=False)
@@ -152,6 +153,7 @@ if __name__ == "__main__":
         enforce_eager=args.enforce_eager,
         max_num_seqs=args.batch_size,
         tensor_parallel_size=args.tensor_parallel_size,
+        pipeline_parallel_size=args.pipeline_parallel_size,
         max_model_len=args.max_model_len,
         max_num_prefill_seqs=args.max_num_prefill_seqs,
         trust_remote_code=True,

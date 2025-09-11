@@ -16,6 +16,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--pipeline-parallel-size", type=int, default=1)
     parser.add_argument("--enforce-eager", action="store_true", default=False)
     parser.add_argument("--expert-parallel", action="store_true", default=False)
     parser.add_argument("--max-num-prefill-seqs", type=int, default=None)
@@ -27,6 +28,7 @@ if __name__ == "__main__":
     llm = vllm.LLM(
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
+        pipeline_parallel_size=args.pipeline_parallel_size,
         enforce_eager=args.enforce_eager,
         dtype=torch.bfloat16,
         max_num_prefill_seqs=args.max_num_prefill_seqs,
