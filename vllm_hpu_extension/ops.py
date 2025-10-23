@@ -368,7 +368,8 @@ def prompt_attention(
         impl: str,
         **args,
 ) -> torch.Tensor:
-    _get_context(args)
+    if args['is_causal']:
+        _get_context(args)
     impl_mapping = {
         'naive_impl': _naive_prompt_attention,
         'fsdpa_impl': _fsdpa_prompt_attention,
