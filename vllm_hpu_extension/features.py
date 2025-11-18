@@ -39,6 +39,15 @@ def get_user_flags():
         Env('PT_HPU_SDPA_QKV_SLICE_MODE_FWD', boolean),
         Env('PT_HPU_SDPA_BC_FACTOR', int),
         Env('VLLM_FUSEDSDPA_SLIDE_THLD', int),
+
+        # Threshold for doing QKV slice in FusedSDPA, set 0 to disable
+        Env('VLLM_FUSEDSDPA_QKV_SLICE_SEQ_LEN_THLD', int),
+        # Chunk sizes for Q slice in full attn
+        Env('VLLM_FUSEDSDPA_Q_SLICE_CHUNK_SIZE', int),
+        # Chunk sizes for KV slice in full attn
+        Env('VLLM_FUSEDSDPA_KV_SLICE_CHUNK_SIZE', int),
+        # Chunk sizes for QKV slice in causal attn
+        Env('VLLM_FUSEDSDPA_CAUSAL_QKV_SLICE_CHUNK_SIZE', int),
     ]
     return to_dict(flags)
 
