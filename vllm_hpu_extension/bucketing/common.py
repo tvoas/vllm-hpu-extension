@@ -124,9 +124,13 @@ class HPUBucketingManager():
                f"{list(buckets)}")
         logger().info(msg)
 
-    def generate_fallback_bucket(self, batch_size, seq_len, ctx):
+    def generate_fallback_bucket(self, batch_size, seq_len, ctx, is_prefill=False):
         assert self.max_num_batched_tokens is not None
-        new_batch_size = calc_fallback_value(batch_size, self.fallback_bs_base_step)
+        max_batch_size = self.max_num_prefill_seqs if is_prefill and self.max_num_prefill_seqs else self.max_num_seqs
+        new_batch_size = min(
+            max_batch_size,
+            calc_fallback_value(batch_size, self.fallback_bs_base_step)
+        )
         if self.use_sliding_window and seq_len >= self.slice_thld:
             new_seq_len = math.ceil(seq_len / self.slice_size) * self.slice_size
         else:
@@ -149,7 +153,7 @@ class HPUBucketingManager():
                 found_bucket = find_equal_or_closest_greater_config(self.prompt_buckets, target_shape)
             if found_bucket is None:
                 if use_fallback:
-                    new_bucket = self.generate_fallback_bucket(batch_size, seq_len, ctx)
+                    new_bucket = self.generate_fallback_bucket(batch_size, seq_len, ctx, is_prefill=True)
                     logger().warning(f"Prompt bucket for {batch_size, seq_len, ctx}"
                                      f" was not prepared. Adding new bucket: {new_bucket}")
                     self.prompt_buckets.append(new_bucket)
@@ -164,7 +168,7 @@ class HPUBucketingManager():
         if self.initialized:
             found_bucket = find_equal_or_closest_greater_config(self.decode_buckets, (batch_size, 1, num_blocks))
             if found_bucket is None:
-                new_bucket = self.generate_fallback_bucket(batch_size, 1, num_blocks)
+                new_bucket = self.generate_fallback_bucket(batch_size, 1, num_blocks, is_prefill=False)
                 logger().warning(f"Decode bucket for {batch_size, 1, num_blocks}"
                                  f" was not prepared. Adding new bucket: {new_bucket}")
                 self.decode_buckets.append(new_bucket)
