@@ -35,6 +35,7 @@ class HPUBucketingManager():
     _instance = None
     prompt_buckets: List[Tuple[int, int, int]] = []
     decode_buckets: List[Tuple[int, int, int]] = []
+    mixed_buckets: List[Tuple[int, int, int, int, int, int]] = []
     initialized = False
 
     def __new__(cls, *args, **kwargs):
@@ -42,10 +43,11 @@ class HPUBucketingManager():
             cls._instance = super(HPUBucketingManager, cls).__new__(cls)
         return cls._instance
 
-    def initialize(self, max_num_seqs, max_num_prefill_seqs, block_size,
+    def initialize(self, max_num_seqs, max_num_prefill_seqs, max_num_mixed_seqs, block_size,
                    max_num_batched_tokens, max_model_len):
         self.max_num_seqs = max_num_seqs
         self.max_num_prefill_seqs = max_num_prefill_seqs
+        self.max_num_mixed_seqs = max_num_mixed_seqs
         self.block_size = block_size
         self.max_num_batched_tokens = max_num_batched_tokens
         self.num_hpu_blocks = None
@@ -115,6 +117,65 @@ class HPUBucketingManager():
             logger().info("Bucketing is off - skipping decode buckets generation")
             self.decode_buckets = []
         return
+    
+    def generate_mixed_buckets(self):
+        """
+        Generate mixed (prompt + decode) warmup buckets.
+
+        Rules:
+          - Only active if chunked prefill is enabled.
+          - Skipped if max_num_mixed_seqs <= max_num_prefill_seqs.
+          - We generate every valid combination of a prompt bucket and a decode
+            bucket such that the number of decode sequences is:
+                decode_bs <= max_num_mixed_seqs - max_num_prefill_seqs
+          - This matches the scheduler logic that limits the number of concurrent
+            decode sequences when both prompt and decode are present.
+        """
+        self.mixed_buckets = []
+
+        if not self.initialized:
+            logger().info("Bucketing is off - skipping mixed buckets generation")
+            return
+
+        if not get_config().chunked_prefill:
+            logger().info("Chunked prefill is disabled - skipping mixed buckets generation")
+            return
+
+        if self.max_num_mixed_seqs is None or self.max_num_prefill_seqs is None:
+            logger().info("max_num_mixed_seqs/max_num_prefill_seqs not set - skipping mixed buckets generation")
+            return
+
+        if self.max_num_mixed_seqs <= self.max_num_prefill_seqs:
+            logger().info("max_num_mixed_seqs <= max_num_prefill_seqs - skipping mixed buckets generation")
+            return
+
+        if not self.prompt_buckets or not self.decode_buckets:
+            logger().info("Prompt or decode buckets empty - skipping mixed buckets generation")
+            return
+
+        # Maximum number of decode sequences that can coexist with prompts.
+        max_decode_seqs = self.max_num_mixed_seqs - self.max_num_prefill_seqs
+
+        mixed: List[Tuple[int, int, int, int, int, int]] = []
+
+        # prompt bucket: (prompt_bs, prompt_seq, prompt_ctx)
+        # decode bucket: (decode_bs, decode_seq, decode_ctx) where decode_seq==1
+        # For mixed mode we only constrain decode batch size (decode_bs).
+        for p_bs, p_seq, p_ctx in self.prompt_buckets:
+            for d_bs, _, d_ctx in self.decode_buckets:
+                if d_bs <= 0:
+                    continue
+                if d_bs > max_decode_seqs:
+                    continue
+                # Mixed bucket is parameterized by decode batch size and blocks.
+                # Prompt side is already covered in prompt_buckets and will be
+                # paired at runtime by the scheduler; here we only need decode
+                # part for warmup graphs.
+                mixed.append((p_bs, p_seq, p_ctx, d_bs, 1, d_ctx))
+
+        mixed = sorted(set(mixed))
+        self.mixed_buckets = mixed
+        self.log_generate_info_mixed()
 
     def log_generate_info(self, is_prompt):
         phase = 'prompt' if is_prompt else 'decode'
@@ -122,6 +183,24 @@ class HPUBucketingManager():
         msg = (f"Generated {len(buckets)} "
                f"{phase} buckets [bs, query, num_blocks]: "
                f"{list(buckets)}")
+        logger().info(msg)
+
+    def log_generate_info_mixed(self):
+        """
+        Log summary of mixed buckets.
+
+        Mixed buckets are stored as
+        [prompt_bs, prompt_seq, prompt_ctx, decode_bs, decode_seq, decode_ctx].
+        They represent the full prompt + decode configuration that will be
+        warmed up for mixed execution.
+        """
+        buckets = self.mixed_buckets
+        msg = (
+            f"Generated {len(buckets)} mixed buckets "
+            f"[prompt_bs, prompt_seq, prompt_ctx, "
+            f"decode_bs, decode_seq, decode_ctx]: "
+            f"{list(buckets)}"
+        )
         logger().info(msg)
 
     def generate_fallback_bucket(self, batch_size, seq_len, ctx, is_prefill=False):
